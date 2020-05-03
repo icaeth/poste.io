@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+
+# === Patches for poste.io free version to be a properly isolated service ===
+#
+# - Restricts all public listening ports to the IP(s) associated with the
+#   container's hostname
+#
+# - Replaces all localhost listening ports with unix-domain sockets inside
+#   the container
+#
+# With these changes, multiple poste.io instances can be run on the same
+# machine (as long as each container has its own public IP), and no internal
+# services (such as quota, websockets, etc.) are exposed to the host's
+# loopback interface.
+
+set -eu  # fail on any errors or undefined variables
+
+# A tiny DSL for editing files with sed: `~ edit files...; {{ commands }}`
+edit() { local sed; ::block sed-dsl; sed -i -e "$sed" "$@"; }
+sed-dsl()    { sed."$@"; }
+sed.sub()    { sed+="s~$1~$2~${3-}"$'\n'; }
+sed.del()    { sed+="${1+/$1/}d"$'\n'; }
+sed.append() { sed+='$a'; ((!$#))||__sedline "$@"; ::block __sedline; sed+=$'\n'; }
+sed.after()  { sed+='/'"$1"'/a'; (($#<2))||__sedline "${@:2}"; ::block __sedline; sed+=$'\n'; }
+sed.range()  { sed+="/$1/,/$2/ {"$'\n'; ::block sed-dsl; sed+=$'}\n'; }
+__sedline()  { sed+="${*/#/\\$'\n'}"; }
+
+# DSL syntax macros: minified runtime copied from https://github.com/bashup/scale-dsl
+shopt -q expand_aliases||{ unalias -a;shopt -s expand_aliases;};builtin alias +='{ ::__;::(){ ((!$#))||{ shift;"${__dsl__[@]-::no-dsl}" ' ~='{ ::__;::(){ ((!$#))||{ shift; ' -='"${__dsl__[@]-::no-dsl}" ' '{{=return;return;};__blk__=;set -- "${__blarg__[@]:1}"; ' '}}=};__:: 0 "$@";}';::block(){ ((!$#))||local __dsl__=("$@");${__blk__:+::};};__bsp__=0;::__(){ __bstk__[__bsp__++]="${__blk__:+__blk__=1;$(declare -f ::)}";};__::(){ local __blarg__=("$@");__blk__=1;:: "$@"||set -- $?;__blk__=;local REPLY;${__bstk__[--__bsp__]:+eval "${__bstk__[__bsp__]}"}||:;return $1;}
+
+
+# === UI bug fix for 2.2.19 ===
+
+~ edit /opt/admin/app/Resources/views/base.html.twig; {{
+  # Fix missing hostnames on IP stats
+  - sub "on('load'," "on('load change',"
+}}
+
+
+# === Restrict public ports to the container hostname IP ===
+
+~ edit /opt/www/webmail/config/config.inc.php; {{
+  # Make webmail connect to the public hostname, instead of localhost
+  + append ""; {{
+    - "\$config['default_host'] = 'ssl://' . gethostname();"
+    - "\$config['smtp_server']  = 'tls://' . gethostname() . ':587';"
+    - "\$config['managesieve_port'] = 4190;"
+    - "\$config['managesieve_host'] = gethostname();"
+    - "\$config['managesieve_usetls'] = true;"
+  }}
+}}
+
+~ edit /healthcheck/nginx.sh; {{
+  - sub "http://127.0.0.1" '"http://$(hostname)"'
+}}
+
+
+~ edit /opt/admin/src/AppBundle/CommandInternal/DeliverQuarantineCommand.php; {{
+  # Quarantine "deliver" / deliver:quarantine should send to host, not localhost
+  - sub "\['msmtp', '-f'.*" "['msmtp', '--host', gethostname(), '-f', \$meta['from']];"
+}}
+
+~ edit /etc/nginx/sites-enabled.templates/{no-,}https; {{
+  # Remove the listen lines that lack an address
+  - del 'listen __HTTP_PORT__;'
+  - del 'listen __HTTPS_PORT__ ssl;'
+
+  # Replace the IPv6 wildcard and any localhost references w/explicit host
+  - sub 'listen \[::\]:' 'listen __HOST__:'
+  - sub localhost '$hostname'
+}}
+
+~ edit /opt/haraka-{smtp,submission}/config/plugins; {{
+  # Fake remote IP to 127.0.0.1 when connection is from localhost
+  - after "status_http" \
+    "inbound_ips"
+  # Add our outbound IP routing plugin
+  - append 'outbound_ips'
+}}
+
+
+# === Replace localhost ports with unix sockets ====
+
+# Note: if you change any of these socket names or locations, they must also be
+# changed in the corresponding files, as applicable:
+#
+# - files/etc/dovecot/local.conf
+# - files/etc/rspamd/override.d/worker-*.inc
+# - files/opt/haraka-smtp/config/redis.ini
+
+sockdir=/var/run
+rspam_web=$sockdir/rspamd-web.sock
+rspam=$sockdir/rspamd-normal.sock
+quota=$sockdir/dovecot-quota.sock
+
+# redis and haraka run unprivileged and so need directories of their own
+mkdir -p       "$sockdir"/redis "$sockdir"/haraka
+chown redis    "$sockdir"/redis
+chown delivery "$sockdir"/haraka
+
+redis="$sockdir"/redis/redis.sock
+haraka_smtp_web=$sockdir/haraka/web-11380.sock
+haraka_sub_web=$sockdir/haraka/web-11381.sock
+
+
+# Change nginx proxy settings to use unix sockets
+
+~ edit /etc/nginx/sites-enabled.templates/{no-,}https; {{
+  - sub 127.0.0.1:11334 unix:"$rspam_web":
+  - sub 'proxy_pass http://127.0.0.1:\$1/' "proxy_pass http://unix:$sockdir/haraka/web-\$1.sock:/"
+}}
+
+# The rspamc command needs to reference the web socket explicitly
+
+~ edit /opt/admin/src/AppBundle/Server/System.php; {{
+  - sub "rspamc stat" \
+        "rspamc -h $rspam_web stat"
+}}
+~ edit /etc/dovecot/sieve/report-{spam,ham}.sieve; {{
+  - sub '"rspamc" \[' \
+        '"rspamc" ["-h" "'"$rspam_web"'" '
+}}
+
+# Disable dovecot quota service on localhost
+
+~ edit /etc/dovecot/conf.d/90-quota.conf; {{
+  + range 'inet_listener' '}'; {{
+    - del
+  }}
+}}
+
+# Haraka plugins need to use sockets for quota instead of ports
+
+~ edit /opt/haraka-smtp/plugins/dovecot_quota.js; {{
+  - sub "socket\\.connect(13001, '127.0.0.1');" \
+        "socket.connect('$quota');"
+}}
+
+# Haraka web servers need to listen on unix sockets
+
+~ edit /opt/haraka-smtp/config/http.ini; {{
+  - sub 'listen=127.0.0.1:11380' "listen=$haraka_smtp_web:777"
+}}
+
+~ edit /opt/haraka-submission/config/http.ini; {{
+  - sub 'listen=127.0.0.1:11381' "listen=$haraka_sub_web:777"
+}}
+
+# Have haraka talk to rspamd via unix socket
+
+~ edit /opt/haraka-{smtp,submission}/config/rspamd.ini; {{
+  - sub '^host.*=.*$' "unix_socket = $rspam"
+}}
+
+# Configure redis to listen on a unix socket, and rspamd+admin to connect there
+
+~ edit /etc/redis/redis.conf; {{
+  - sub "^port 6379" "port 0"  # disable the localhost port
+  - append "" "unixsocket $redis" "unixsocketperm 777"
+}}
+
+~ edit /etc/rspamd/local.d/{redis,statistic}.conf; {{
+  - sub 'servers = "127.*;$' \
+        'servers = "'"$redis"'";'
+}}
+
+~ edit /healthcheck/redis.sh; {{
+  - sub '-h "127.0.0.1"' "-s '$redis'";
+}}
+
+~ edit /opt/admin/src/AppBundle/Resources/config/services.yml; {{
+  - sub '^  Predis\\Client: .*$' \
+         '  Predis\\Client: { arguments: [ "unix:'"$redis"'" ] }'
+
+  # The above change won't take effect unless the service cache is cleared:
+  rm -rf /opt/admin/var/cache/prod
+}}
+
+# === Support Roundcube plugins and persistent encryption key
+
+# Load 48-digit hex des_key from DES_KEY
+~ edit /etc/cont-init.d/20-apply-server-config; {{
+  - sub '[$]key = bin2hex' '$key = getenv("DES_KEY") ?: bin2hex'
+}}
+
+# Autoload roundcube plugins from /data/roundcube/installed-plugins
+
+~ edit /opt/www/webmail/config/config.inc.php; {{
+  + append ""; {{
+    - 'foreach ( explode("\\n", file_get_contents("/data/roundcube/installed-plugins")) as $line ) {'
+    - '    $line = trim($line);'
+    - '    if ( "" === $line || substr($line,0,1) === "#" || ! is_dir("plugins/$line")) continue;'
+    - '    $config["plugins"][] = $line;'
+    - '}'
+  }}
+}}
